@@ -203,10 +203,6 @@ show_info_maybe_halt(O, Opts, F) ->
 %%
 commands() ->
     S = <<"
-dialyze                              Analyze with Dialyzer
-build-plt                            Build Dialyzer PLT
-check-plt                            Check Dialyzer PLT
-
 clean                                Clean
 compile                              Compile sources
 
@@ -221,6 +217,7 @@ check-deps                           Display to be fetched dependencies
 get-deps                             Fetch dependencies
 update-deps                          Update fetched dependencies
 delete-deps                          Delete fetched dependencies
+list-deps                            List dependencies
 
 generate    [dump_spec=0/1]          Build release with reltool
 
@@ -277,10 +274,10 @@ filter_flags([Item | Rest], Commands) ->
     end.
 
 command_names() ->
-    ["build-plt", "check-deps", "check-plt", "clean", "compile", "create",
-     "create-app", "create-node", "ct", "delete-deps", "dialyze", "doc",
-     "eunit", "generate", "generate-appups", "generate-upgrade", "get-deps",
-     "help", "list-templates", "update-deps", "version", "xref"].
+    ["check-deps", "clean", "compile", "create", "create-app", "create-node",
+     "ct", "delete-deps", "doc", "eunit", "generate", "generate-appups",
+     "generate-upgrade", "get-deps", "help", "list-deps", "list-templates",
+     "update-deps", "version", "xref"].
 
 unabbreviate_command_names([]) ->
     [];
@@ -324,17 +321,15 @@ is_command_name_sub_word_candidate(Command, Candidate) ->
     %% Allow for parts of commands to be abbreviated, i.e. create-app
     %% can be shortened to "create-a", "c-a" or "c-app" (but not
     %% "create-" since that would be ambiguous).
-    CommandSubWords = re:split(Command, "-", [{return, list}]),
-    CandidateSubWords = re:split(Candidate, "-", [{return, list}]),
+    ReOpts = [{return, list}],
+    CommandSubWords = re:split(Command, "-", ReOpts),
+    CandidateSubWords = re:split(Candidate, "-", ReOpts),
     is_command_name_sub_word_candidate_aux(CommandSubWords, CandidateSubWords).
 
-is_command_name_sub_word_candidate_aux([CmdSW | CmdSWs], [CandSW | CandSWs]) ->
-    case lists:prefix(CmdSW, CandSW) of
-        true ->
-            is_command_name_sub_word_candidate_aux(CmdSWs, CandSWs);
-        false ->
-            false
-    end;
+is_command_name_sub_word_candidate_aux([CmdSW | CmdSWs],
+                                       [CandSW | CandSWs]) ->
+    lists:prefix(CmdSW, CandSW) andalso
+        is_command_name_sub_word_candidate_aux(CmdSWs, CandSWs);
 is_command_name_sub_word_candidate_aux([], []) ->
     true;
 is_command_name_sub_word_candidate_aux(_CmdSWs, _CandSWs) ->
