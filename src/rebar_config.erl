@@ -26,7 +26,7 @@
 %% -------------------------------------------------------------------
 -module(rebar_config).
 
--export([new/0, new/1,
+-export([new/0, new/1, base_config/1,
          get/3, get_local/3, get_list/3,
          get_all/2,
          set/3,
@@ -48,25 +48,30 @@
 %% Public API
 %% ===================================================================
 
+base_config(#config{opts=Opts0}) ->
+    ConfName = rebar_config:get_global(config, "rebar.config"),
+    new(Opts0, ConfName).
+
 new() ->
     #config { dir = rebar_utils:get_cwd(),
-              opts = []}.
+              opts = [] }.
 
-new(ParentConfig) ->
-    %% If we are at the top level we might want to load another rebar.config
-    %% We can be certain that we are at the top level if we don't have any
-    %% configs yet since if we are at another level we must have some config.
-    ConfName = case ParentConfig of
-                   {config, _, []} ->
-                       rebar_config:get_global(config, "rebar.config");
-                   _ ->
-                       "rebar.config"
-               end,
+new(ConfigFile) when is_list(ConfigFile) ->
+    case consult_file(ConfigFile) of
+        {ok, Opts} ->
+            #config { dir = rebar_utils:get_cwd(),
+                      opts = Opts };
+        Other ->
+            ?ABORT("Failed to load ~s: ~p~n", [ConfigFile, Other])
+    end;
+new(_ParentConfig=#config{opts=Opts0})->
+    new(Opts0, "rebar.config").
 
+new(Opts0, ConfName) ->
     %% Load terms from rebar.config, if it exists
     Dir = rebar_utils:get_cwd(),
     ConfigFile = filename:join([Dir, ConfName]),
-    Opts = case file:consult(ConfigFile) of
+    Opts = case consult_file(ConfigFile) of
                {ok, Terms} ->
                    %% Found a config file with some terms. We need to
                    %% be able to distinguish between local definitions
@@ -75,10 +80,10 @@ new(ParentConfig) ->
                    %% in the proplist (since order matters) between
                    %% the new and old defs.
                    Terms ++ [local] ++
-                       [Opt || Opt <- ParentConfig#config.opts, Opt /= local];
+                       [Opt || Opt <- Opts0, Opt /= local];
                {error, enoent} ->
                    [local] ++
-                       [Opt || Opt <- ParentConfig#config.opts, Opt /= local];
+                       [Opt || Opt <- Opts0, Opt /= local];
                Other ->
                    ?ABORT("Failed to load ~s: ~p\n", [ConfigFile, Other])
            end,
@@ -125,6 +130,10 @@ get_jobs() ->
 %% ===================================================================
 %% Internal functions
 %% ===================================================================
+
+consult_file(File) ->
+    ?DEBUG("Consult config file ~p~n", [File]),
+    file:consult(File).
 
 local_opts([], Acc) ->
     lists:reverse(Acc);
