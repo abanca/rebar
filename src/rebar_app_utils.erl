@@ -152,9 +152,11 @@ vcs_vsn(Vcs, Dir) ->
                     %% tree structure, there may be one higher up, but that can
                     %% yield unexpected results when used with deps. So, we
                     %% fallback to searching for a priv/vsn.Vcs file.
-                    case file:read_file(filename:join([Dir, "priv", "vsn" ++ Extension])) of
+                    VsnFile = filename:join([Dir, "priv", "vsn" ++ Extension]),
+                    case file:read_file(VsnFile) of
                         {ok, VsnBin} ->
-                            ?DEBUG("vcs_vsn: Read ~s from priv/vsn.~p\n", [VsnBin, Vcs]),
+                            ?DEBUG("vcs_vsn: Read ~s from priv/vsn.~p\n",
+                                   [VsnBin, Vcs]),
                             string:strip(binary_to_list(VsnBin), right, $\n);
                         {error, enoent} ->
                             ?DEBUG("vcs_vsn: Fallback to vcs for ~s\n", [Dir]),
@@ -163,7 +165,11 @@ vcs_vsn(Vcs, Dir) ->
             end
     end.
 
-vcs_vsn_cmd(git) -> "git describe --always --tags";
+vcs_vsn_cmd(git) ->
+    %% Explicitly git-describe a committish to accommodate for projects
+    %% in subdirs which don't have a GIT_DIR. In that case we will
+    %% get a description of the last commit that touched the subdir.
+    "git describe --always --tags `git log -n 1 --pretty=format:%h .`";
 vcs_vsn_cmd(hg)  -> "hg identify -i";
 vcs_vsn_cmd(bzr) -> "bzr revno";
 vcs_vsn_cmd(svn) -> "svnversion";
