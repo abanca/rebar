@@ -201,6 +201,7 @@ update_deps_code_path([Dep | Rest]) ->
         {true, _} ->
             Dir = filename:join(Dep#dep.dir, "ebin"),
             ok = filelib:ensure_dir(filename:join(Dir, "dummy")),
+            ?DEBUG("Adding ~s to code path", [Dir]),
             true = code:add_patha(Dir);
         {false, _} ->
             true
@@ -282,7 +283,7 @@ require_source_engine(Source) ->
     ok.
 
 is_app_available(App, VsnRegex, Path) ->
-    ?DEBUG("is_app_available, looking for App ~p  with Path ~p~n", [App, Path]),
+    ?DEBUG("is_app_available, looking for App ~p with Path ~p~n", [App, Path]),
     case rebar_app_utils:is_app_dir(Path) of
         {true, AppFile} ->
             case rebar_app_utils:app_name(AppFile) of
