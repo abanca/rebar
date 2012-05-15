@@ -42,8 +42,13 @@
          find_executable/1,
          prop_check/3,
          expand_code_path/0,
-         deprecated/5,
-         expand_env_variable/3]).
+         deprecated/3, deprecated/4,
+         expand_env_variable/3,
+         vcs_vsn/2,
+         get_deprecated_global/3,
+         get_deprecated_list/4, get_deprecated_list/5,
+         get_deprecated_local/4, get_deprecated_local/5,
+         delayed_halt/1]).
 
 -include("rebar.hrl").
 
@@ -54,7 +59,6 @@
 get_cwd() ->
     {ok, Dir} = file:get_cwd(),
     Dir.
-
 
 is_arch(ArchRegex) ->
     case re:run(get_arch(), ArchRegex, [{capture, none}]) of
@@ -87,8 +91,8 @@ wordsize() ->
 %% Val = string() | false
 %%
 sh(Command0, Options0) ->
-    ?INFO("sh info:\n\tcwd: ~p\n\tcmd: ~s\n\topts: ~p\n",
-          [get_cwd(), Command0, Options0]),
+    ?INFO("sh info:\n\tcwd: ~p\n\tcmd: ~s\n", [get_cwd(), Command0]),
+    ?DEBUG("\topts: ~p\n", [Options0]),
 
     DefaultOptions = [use_stdout, abort_on_error],
     Options = [expand_sh_flag(V)
@@ -107,18 +111,6 @@ sh(Command0, Options0) ->
             Ok;
         {error, {_Rc, _Output}=Err} ->
             ErrorHandler(Command, Err)
-    end.
-
-%% We do the shell variable substitution ourselves on Windows and hope that the
-%% command doesn't use any other shell magic.
-patch_on_windows(Cmd, Env) ->
-    case os:type() of
-        {win32,nt} ->
-            "cmd /q /c " ++ lists:foldl(fun({Key, Value}, Acc) ->
-                                            expand_env_variable(Acc, Key, Value)
-                                        end, Cmd, Env);
-        _ ->
-            Cmd
     end.
 
 find_files(Dir, Regex) ->
@@ -148,7 +140,7 @@ ensure_dir(Path) ->
 -spec abort(string(), [term()]) -> no_return().
 abort(String, Args) ->
     ?ERROR(String, Args),
-    halt(1).
+    delayed_halt(1).
 
 %% TODO: Rename emulate_escript_foldl to escript_foldl and remove
 %% this function when the time is right. escript:foldl/3 was an
@@ -199,10 +191,155 @@ expand_env_variable(InStr, VarName, RawVarValue) ->
             re:replace(InStr, RegEx, [VarValue, "\\2"], ReOpts)
     end.
 
+vcs_vsn(Vcs, Dir) ->
+    Key = {Vcs, Dir},
+    try ets:lookup_element(rebar_vsn_cache, Key, 2)
+    catch
+        error:badarg ->
+            VsnString = vcs_vsn_1(Vcs, Dir),
+            ets:insert(rebar_vsn_cache, {Key, VsnString}),
+            VsnString
+    end.
+
+vcs_vsn_1(Vcs, Dir) ->
+    case vcs_vsn_cmd(Vcs) of
+        {unknown, VsnString} ->
+            ?DEBUG("vcs_vsn: Unknown VCS atom in vsn field: ~p\n", [Vcs]),
+            VsnString;
+        {cmd, CmdString} ->
+            vcs_vsn_invoke(CmdString, Dir);
+        Cmd ->
+            %% If there is a valid VCS directory in the application directory,
+            %% use that version info
+            Extension = lists:concat([".", Vcs]),
+            case filelib:is_dir(filename:join(Dir, Extension)) of
+                true ->
+                    ?DEBUG("vcs_vsn: Primary vcs used for ~s\n", [Dir]),
+                    vcs_vsn_invoke(Cmd, Dir);
+                false ->
+                    %% No VCS directory found for the app. Depending on source
+                    %% tree structure, there may be one higher up, but that can
+                    %% yield unexpected results when used with deps. So, we
+                    %% fallback to searching for a priv/vsn.Vcs file.
+                    VsnFile = filename:join([Dir, "priv", "vsn" ++ Extension]),
+                    case file:read_file(VsnFile) of
+                        {ok, VsnBin} ->
+                            ?DEBUG("vcs_vsn: Read ~s from priv/vsn.~p\n",
+                                   [VsnBin, Vcs]),
+                            string:strip(binary_to_list(VsnBin), right, $\n);
+                        {error, enoent} ->
+                            ?DEBUG("vcs_vsn: Fallback to vcs for ~s\n", [Dir]),
+                            vcs_vsn_invoke(Cmd, Dir)
+                    end
+            end
+    end.
+
+get_deprecated_global(OldOpt, NewOpt, When) ->
+    get_deprecated_global(OldOpt, NewOpt, undefined, When).
+
+get_deprecated_global(OldOpt, NewOpt, Default, When) ->
+    case rebar_config:get_global(NewOpt, Default) of
+        undefined ->
+            case rebar_config:get_global(OldOpt, Default) of
+                undefined ->
+                    undefined;
+                Old ->
+                    deprecated(OldOpt, NewOpt, When),
+                    Old
+            end;
+        New ->
+            New
+    end.
+
+
+get_deprecated_list(Config, OldOpt, NewOpt, When) ->
+    get_deprecated_list(Config, OldOpt, NewOpt, undefined, When).
+
+get_deprecated_list(Config, OldOpt, NewOpt, Default, When) ->
+    get_deprecated_3(fun rebar_config:get_list/3,
+                     Config, OldOpt, NewOpt, Default, When).
+
+get_deprecated_local(Config, OldOpt, NewOpt, When) ->
+    get_deprecated_local(Config, OldOpt, NewOpt, undefined, When).
+
+get_deprecated_local(Config, OldOpt, NewOpt, Default, When) ->
+    get_deprecated_3(fun rebar_config:get_local/3,
+                     Config, OldOpt, NewOpt, Default, When).
+
+deprecated(Old, New, Opts, When) when is_list(Opts) ->
+    case lists:member(Old, Opts) of
+        true ->
+            deprecated(Old, New, When);
+        false ->
+            ok
+    end;
+deprecated(Old, New, Config, When) ->
+    case rebar_config:get(Config, Old, undefined) of
+        undefined ->
+            ok;
+        _ ->
+            deprecated(Old, New, When)
+    end.
+
+deprecated(Old, New, When) ->
+    io:format(
+      <<"WARNING: deprecated ~p option used~n"
+        "Option '~p' has been deprecated~n"
+        "in favor of '~p'.~n"
+        "'~p' will be removed ~s.~n~n">>,
+      [Old, Old, New, Old, When]).
+
+-spec delayed_halt(integer()) -> no_return().
+delayed_halt(Code) ->
+    %% Work around buffer flushing issue in erlang:halt if OTP older
+    %% than R15B01.
+    %% TODO: remove workaround once we require R15B01 or newer
+    %% R15B01 introduced erlang:halt/2
+    case erlang:is_builtin(erlang, halt, 2) of
+        true ->
+            halt(Code);
+        false ->
+            case os:type() of
+                {win32, nt} ->
+                    timer:sleep(100),
+                    halt(Code);
+                _ ->
+                    halt(Code),
+                    %% workaround to delay exit until all output is written
+                    receive after infinity -> ok end
+            end
+    end.
 
 %% ====================================================================
 %% Internal functions
 %% ====================================================================
+
+get_deprecated_3(Get, Config, OldOpt, NewOpt, Default, When) ->
+    case Get(Config, NewOpt, Default) of
+        Default ->
+            case Get(Config, OldOpt, Default) of
+                Default ->
+                    Default;
+                Old ->
+                    deprecated(OldOpt, NewOpt, When),
+                    Old
+            end;
+        New ->
+            New
+    end.
+
+%% We do the shell variable substitution ourselves on Windows and hope that the
+%% command doesn't use any other shell magic.
+patch_on_windows(Cmd, Env) ->
+    case os:type() of
+        {win32,nt} ->
+            "cmd /q /c "
+                ++ lists:foldl(fun({Key, Value}, Acc) ->
+                                       expand_env_variable(Acc, Key, Value)
+                               end, Cmd, Env);
+        _ ->
+            Cmd
+    end.
 
 expand_sh_flag(return_on_error) ->
     {error_handler,
@@ -285,15 +422,23 @@ emulate_escript_foldl(Fun, Acc, File) ->
             Error
     end.
 
-deprecated(Key, Old, New, Opts, When) ->
-    case lists:member(Old, Opts) of
-        true ->
-            io:format(
-              <<"WARNING: deprecated ~p option used~n"
-                "Option '~p' has been deprecated~n"
-                "in favor of '~p'.~n"
-                "'~p' will be removed ~s.~n~n">>,
-              [Key, Old, New, Old, When]);
-        false ->
-            ok
-    end.
+vcs_vsn_cmd(git) ->
+    %% git describe the last commit that touched CWD
+    %% required for correct versioning of apps in subdirs, such as apps/app1
+    case os:type() of
+        {win32,nt} ->
+            "FOR /F \"usebackq tokens=* delims=\" %i in "
+                "(`git log -n 1 \"--pretty=format:%h\" .`) do "
+                "@git describe --always --tags %i";
+        _ ->
+            "git describe --always --tags `git log -n 1 --pretty=format:%h .`"
+    end;
+vcs_vsn_cmd(hg)  -> "hg identify -i";
+vcs_vsn_cmd(bzr) -> "bzr revno";
+vcs_vsn_cmd(svn) -> "svnversion";
+vcs_vsn_cmd({cmd, _Cmd}=Custom) -> Custom;
+vcs_vsn_cmd(Version) -> {unknown, Version}.
+
+vcs_vsn_invoke(Cmd, Dir) ->
+    {ok, VsnString} = rebar_utils:sh(Cmd, [{cd, Dir}, {use_stdout, false}]),
+    string:strip(VsnString, right, $\n).

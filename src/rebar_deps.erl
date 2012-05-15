@@ -97,11 +97,17 @@ compile(Config, AppFile) ->
 setup_env(_Config) ->
     {true, DepsDir} = get_deps_dir(),
     %% include rebar's DepsDir in ERL_LIBS
+    Separator = case os:type() of
+                    {win32, nt} ->
+                        ";";
+                    _ ->
+                        ":"
+                end,
     ERL_LIBS = case os:getenv("ERL_LIBS") of
                    false ->
                        {"ERL_LIBS", DepsDir};
                    PrevValue ->
-                       {"ERL_LIBS", DepsDir ++ ":" ++ PrevValue}
+                       {"ERL_LIBS", DepsDir ++ Separator ++ PrevValue}
                end,
     [{"REBAR_DEPS_DIR", DepsDir}, ERL_LIBS].
 
@@ -201,7 +207,7 @@ update_deps_code_path([Dep | Rest]) ->
         {true, _} ->
             Dir = filename:join(Dep#dep.dir, "ebin"),
             ok = filelib:ensure_dir(filename:join(Dir, "dummy")),
-            ?DEBUG("Adding ~s to code path", [Dir]),
+            ?DEBUG("Adding ~s to code path~n", [Dir]),
             true = code:add_patha(Dir);
         {false, _} ->
             true
@@ -352,9 +358,9 @@ download_source(AppDir, {hg, Url, Rev}) ->
                    [{cd, filename:dirname(AppDir)}]),
     rebar_utils:sh(?FMT("hg update ~s", [Rev]), [{cd, AppDir}]);
 download_source(AppDir, {git, Url}) ->
-    download_source(AppDir, {git, Url, "HEAD"});
+    download_source(AppDir, {git, Url, {branch, "HEAD"}});
 download_source(AppDir, {git, Url, ""}) ->
-    download_source(AppDir, {git, Url, "HEAD"});
+    download_source(AppDir, {git, Url, {branch, "HEAD"}});
 download_source(AppDir, {git, Url, {branch, Branch}}) ->
     ok = filelib:ensure_dir(AppDir),
     rebar_utils:sh(?FMT("git clone -n ~s ~s", [Url, filename:basename(AppDir)]),
@@ -379,7 +385,10 @@ download_source(AppDir, {svn, Url, Rev}) ->
     ok = filelib:ensure_dir(AppDir),
     rebar_utils:sh(?FMT("svn checkout -r ~s ~s ~s",
                         [Rev, Url, filename:basename(AppDir)]),
-                   [{cd, filename:dirname(AppDir)}]).
+                   [{cd, filename:dirname(AppDir)}]);
+download_source(AppDir, {rsync, Url}) ->
+    ok = filelib:ensure_dir(AppDir),
+    rebar_utils:sh(?FMT("rsync -az --delete ~s/ ~s", [Url, AppDir]), []).
 
 update_source(Dep) ->
     %% It's possible when updating a source, that a given dep does not have a
@@ -400,9 +409,9 @@ update_source(Dep) ->
     end.
 
 update_source(AppDir, {git, Url}) ->
-    update_source(AppDir, {git, Url, "HEAD"});
+    update_source(AppDir, {git, Url, {branch, "HEAD"}});
 update_source(AppDir, {git, Url, ""}) ->
-    update_source(AppDir, {git, Url, "HEAD"});
+    update_source(AppDir, {git, Url, {branch, "HEAD"}});
 update_source(AppDir, {git, _Url, {branch, Branch}}) ->
     ShOpts = [{cd, AppDir}],
     rebar_utils:sh("git fetch origin", ShOpts),
@@ -420,7 +429,10 @@ update_source(AppDir, {svn, _Url, Rev}) ->
 update_source(AppDir, {hg, _Url, Rev}) ->
     rebar_utils:sh(?FMT("hg pull -u -r ~s", [Rev]), [{cd, AppDir}]);
 update_source(AppDir, {bzr, _Url, Rev}) ->
-    rebar_utils:sh(?FMT("bzr update -r ~s", [Rev]), [{cd, AppDir}]).
+    rebar_utils:sh(?FMT("bzr update -r ~s", [Rev]), [{cd, AppDir}]);
+update_source(AppDir, {rsync, Url}) ->
+    rebar_utils:sh(?FMT("rsync -az --delete ~s/ ~s",[Url,AppDir]),[]).
+
 
 
 
@@ -433,7 +445,7 @@ source_engine_avail(Source) ->
     source_engine_avail(Name, Source).
 
 source_engine_avail(Name, Source)
-  when Name == hg; Name == git; Name == svn; Name == bzr ->
+  when Name == hg; Name == git; Name == svn; Name == bzr; Name == rsync ->
     case vcs_client_vsn(Name) >= required_vcs_client_vsn(Name) of
         true ->
             true;
@@ -454,10 +466,11 @@ vcs_client_vsn(Path, VsnArg, VsnRegex) ->
             false
     end.
 
-required_vcs_client_vsn(hg)  -> {1, 1};
-required_vcs_client_vsn(git) -> {1, 5};
-required_vcs_client_vsn(bzr) -> {2, 0};
-required_vcs_client_vsn(svn) -> {1, 6}.
+required_vcs_client_vsn(hg)    -> {1, 1};
+required_vcs_client_vsn(git)   -> {1, 5};
+required_vcs_client_vsn(bzr)   -> {2, 0};
+required_vcs_client_vsn(svn)   -> {1, 6};
+required_vcs_client_vsn(rsync) -> {2, 0}.
 
 vcs_client_vsn(hg) ->
     vcs_client_vsn(rebar_utils:find_executable("hg"), " --version",
@@ -470,7 +483,10 @@ vcs_client_vsn(bzr) ->
                    "Bazaar \\(bzr\\) (\\d+).(\\d+)");
 vcs_client_vsn(svn) ->
     vcs_client_vsn(rebar_utils:find_executable("svn"), " --version",
-                   "svn, version (\\d+).(\\d+)").
+                   "svn, version (\\d+).(\\d+)");
+vcs_client_vsn(rsync) ->
+    vcs_client_vsn(rebar_utils:find_executable("rsync"), " --version",
+                   "rsync  version (\\d+).(\\d+)").
 
 has_vcs_dir(git, Dir) ->
     filelib:is_dir(filename:join(Dir, ".git"));
@@ -481,6 +497,8 @@ has_vcs_dir(bzr, Dir) ->
 has_vcs_dir(svn, Dir) ->
     filelib:is_dir(filename:join(Dir, ".svn"))
         orelse filelib:is_dir(filename:join(Dir, "_svn"));
+has_vcs_dir(rsync, _) ->
+    true;
 has_vcs_dir(_, _) ->
     true.
 

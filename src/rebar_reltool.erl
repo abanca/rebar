@@ -31,7 +31,6 @@
          clean/2]).
 
 -include("rebar.hrl").
--include_lib("reltool/src/reltool.hrl").
 -include_lib("kernel/include/file.hrl").
 
 %% ===================================================================
@@ -196,11 +195,14 @@ run_reltool(Server, _Config, ReltoolConfig) ->
             TargetDir = rebar_rel_utils:get_target_dir(ReltoolConfig),
             mk_target_dir(TargetDir),
 
+            %% Determine the otp root dir to use
+            RootDir = rebar_rel_utils:get_root_dir(ReltoolConfig),
+
             %% Dump the spec, if necessary
             dump_spec(Spec),
 
             %% Have reltool actually run
-            case reltool:eval_target_spec(Spec, code:root_dir(), TargetDir) of
+            case reltool:eval_target_spec(Spec, RootDir, TargetDir) of
                 ok ->
                     ok;
                 {error, Reason} ->
@@ -208,7 +210,7 @@ run_reltool(Server, _Config, ReltoolConfig) ->
                            [Reason])
             end,
 
-            {BootRelName, BootRelVsn} = 
+            {BootRelName, BootRelVsn} =
                 rebar_rel_utils:get_reltool_release_info(ReltoolConfig),
 
             ok = create_RELEASES(TargetDir, BootRelName, BootRelVsn),

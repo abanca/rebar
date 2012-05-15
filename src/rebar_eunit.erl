@@ -33,11 +33,12 @@
 %%       If true, try to "reset" VM state to approximate state prior to
 %%       running the EUnit tests:
 %%       <ul>
-%%          <li> Stop net_kernel if it was started </li>
-%%          <li> Stop OTP applications not running before EUnit tests were run </li>
-%%          <li> Kill processes not running before EUnit tests were run </li>
-%%          <li> Reset OTP application environment variables  </li>
-%%       </ul> </li>
+%%        <li>Stop net_kernel if it was started</li>
+%%        <li>Stop OTP applications not running before EUnit tests were run</li>
+%%        <li>Kill processes not running before EUnit tests were run</li>
+%%        <li>Reset OTP application environment variables</li>
+%%       </ul>
+%%   </li>
 %% </ul>
 %% The following Global options are supported:
 %% <ul>
@@ -63,40 +64,7 @@
 %% Public API
 %% ===================================================================
 
-eunit(Config, AppFile) ->
-    %% Check for app global parameter; this is a comma-delimited list
-    %% of apps on which we want to run eunit
-    case rebar_config:get_global(app, undefined) of
-        undefined ->
-            %% No app parameter specified, check the skip list..
-            case rebar_config:get_global(skip_app, undefined) of
-                undefined ->
-                    %% no skip list, run everything..
-                    ok;
-                SkipApps ->
-                    TargetApps = [list_to_atom(A) ||
-                                     A <- string:tokens(SkipApps, ",")],
-                    ThisApp = rebar_app_utils:app_name(AppFile),
-                    case lists:member(ThisApp, TargetApps) of
-                        false ->
-                            ok;
-                        true ->
-                            ?DEBUG("Skipping eunit on app: ~p\n", [ThisApp]),
-                            throw(ok)
-                    end
-            end;
-        Apps ->
-            TargetApps = [list_to_atom(A) || A <- string:tokens(Apps, ",")],
-            ThisApp = rebar_app_utils:app_name(AppFile),
-            case lists:member(ThisApp, TargetApps) of
-                true ->
-                    ok;
-                false ->
-                    ?DEBUG("Skipping eunit on app: ~p\n", [ThisApp]),
-                    throw(ok)
-            end
-    end,
-
+eunit(Config, _AppFile) ->
     %% Make sure ?EUNIT_DIR/ and ebin/ directory exists (tack on dummy module)
     ok = filelib:ensure_dir(eunit_dir() ++ "/foo"),
     ok = filelib:ensure_dir(ebin_dir() ++ "/foo"),
@@ -118,6 +86,27 @@ eunit(Config, AppFile) ->
     %% in src but in a subdirectory of src. Cover only looks in cwd and ../src
     %% for source files.
     SrcErls = rebar_utils:find_files("src", ".*\\.erl\$"),
+
+    %% If it is not the first time rebar eunit is executed, there will be source
+    %% files already present in ?EUNIT_DIR. Since some SCMs (like Perforce) set
+    %% the source files as being read only (unless they are checked out), we
+    %% need to be sure that the files already present in ?EUNIT_DIR are writable
+    %% before doing the copy. This is done here by removing any file that was
+    %% already present before calling rebar_file_utils:cp_r.
+
+    %% Get the full path to a file that was previously copied in ?EUNIT_DIR
+    ToCleanUp = fun(F, Acc) ->
+                        F2 = filename:basename(F),
+                        F3 = filename:join([?EUNIT_DIR, F2]),
+                        case filelib:is_regular(F3) of
+                            true -> [F3|Acc];
+                            false -> Acc
+                        end
+                end,
+
+    ok = rebar_file_utils:delete_each(lists:foldl(ToCleanUp, [], TestErls)),
+    ok = rebar_file_utils:delete_each(lists:foldl(ToCleanUp, [], SrcErls)),
+
     ok = rebar_file_utils:cp_r(SrcErls ++ TestErls, ?EUNIT_DIR),
 
     %% Compile erlang code to ?EUNIT_DIR, using a tweaked config
@@ -510,7 +499,11 @@ kill_extras(Pids) ->
     %% This list may require changes as OTP versions and/or
     %% rebar use cases change.
     KeepProcs = [cover_server, eunit_server,
-                 eqc, eqc_license, eqc_locked],
+                 eqc, eqc_license, eqc_locked,
+                 %% inet_gethost_native is started on demand, when
+                 %% doing name lookups. It is under kernel_sup, under
+                 %% a supervisor_bridge.
+                 inet_gethost_native],
     Killed = [begin
                   Info = case erlang:process_info(Pid) of
                              undefined -> [];
@@ -562,12 +555,47 @@ reconstruct_app_env_vars([App|Apps]) ->
                   _ ->
                       []
               end,
-    AllVars = CmdVars ++ AppVars,
+
+    %% App vars specified in config files override those in the .app file.
+    %% Config files later in the args list override earlier ones.
+    AppVars1 = case init:get_argument(config) of
+                   {ok, ConfigFiles} ->
+                       {App, MergedAppVars} = lists:foldl(fun merge_app_vars/2,
+                                                          {App, AppVars},
+                                                          ConfigFiles),
+                       MergedAppVars;
+                   error ->
+                       AppVars
+               end,
+    AllVars = CmdVars ++ AppVars1,
     ?DEBUG("Reconstruct ~p ~p\n", [App, AllVars]),
     lists:foreach(fun({K, V}) -> application:set_env(App, K, V) end, AllVars),
     reconstruct_app_env_vars(Apps);
 reconstruct_app_env_vars([]) ->
     ok.
+
+merge_app_vars(ConfigFile, {App, AppVars}) ->
+    File = ensure_config_extension(ConfigFile),
+    FileAppVars = app_vars_from_config_file(File, App),
+    Dict1 = dict:from_list(AppVars),
+    Dict2 = dict:from_list(FileAppVars),
+    Dict3 = dict:merge(fun(_Key, _Value1, Value2) -> Value2 end, Dict1, Dict2),
+    {App, dict:to_list(Dict3)}.
+
+ensure_config_extension(File) ->
+    %% config files must end with .config on disk but when specifying them
+    %% via the -config option the extension is optional
+    BaseFileName = filename:basename(File, ".config"),
+    DirName = filename:dirname(File),
+    filename:join(DirName, BaseFileName ++ ".config").
+
+app_vars_from_config_file(File, App) ->
+    case file:consult(File) of
+        {ok, [Env]} ->
+            proplists:get_value(App, Env, []);
+        _ ->
+            []
+    end.
 
 wait_until_dead(Pid) when is_pid(Pid) ->
     Ref = erlang:monitor(process, Pid),
