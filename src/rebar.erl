@@ -29,7 +29,8 @@
 -export([main/1,
          help/0,
          parse_args/1,
-         version/0]).
+         version/0,
+         get_jobs/1]).
 
 -include("rebar.hrl").
 
@@ -41,6 +42,12 @@
 -define(VCS_INFO, "undefined").
 -endif.
 
+-ifndef(OTP_INFO).
+-define(OTP_INFO, "undefined").
+-endif.
+
+-define(DEFAULT_JOBS, 3).
+
 %% ====================================================================
 %% Public API
 %% ====================================================================
@@ -49,71 +56,51 @@ main(Args) ->
     case catch(run(Args)) of
         ok ->
             ok;
-        {error, failed} ->
-            halt(1);
+        rebar_abort ->
+            rebar_utils:delayed_halt(1);
         Error ->
             %% Nothing should percolate up from rebar_core;
             %% Dump this error to console
             io:format("Uncaught error in rebar_core: ~p\n", [Error]),
-            halt(1)
+            rebar_utils:delayed_halt(1)
     end.
 
 %% ====================================================================
 %% Internal functions
 %% ====================================================================
 
+run(["help"]) ->
+    help();
+run(["version"]) ->
+    ok = load_rebar_app(),
+    %% Display vsn and build time info
+    version();
 run(RawArgs) ->
-    %% Pre-load the rebar app so that we get default configuration
-    ok = application:load(rebar),
+    ok = load_rebar_app(),
     %% Parse out command line arguments -- what's left is a list of commands to
     %% run -- and start running commands
     Args = parse_args(RawArgs),
+    BaseConfig = init_config(Args),
+    {BaseConfig1, Cmds} = save_options(BaseConfig, Args),
 
-    case rebar_config:get_global(enable_profiling, false) of
+    case rebar_config:get_xconf(BaseConfig1, enable_profiling, false) of
         true ->
             io:format("Profiling!\n"),
             try
-                fprof:apply(fun(A) -> run_aux(A) end, [Args])
+                fprof:apply(fun run_aux/2, [BaseConfig1, Cmds])
             after
-                fprof:profile(),
-                fprof:analyse([{dest, "fprof.analysis"}])
+                ok = fprof:profile(),
+                ok = fprof:analyse([{dest, "fprof.analysis"}])
             end;
-        _ ->
-            run_aux(Args)
+        false ->
+            run_aux(BaseConfig1, Cmds)
     end.
 
-run_aux(["help"]) ->
-    help(),
-    ok;
-run_aux(["version"]) ->
-    %% Display vsn and build time info
-    version(),
-    ok;
-run_aux(Commands) ->
-    %% Make sure crypto is running
-    ok = crypto:start(),
+load_rebar_app() ->
+    %% Pre-load the rebar app so that we get default configuration
+    ok = application:load(rebar).
 
-    %% Initialize logging system
-    rebar_log:init(),
-
-    %% Initialize vsn cache
-    _VsnCacheTab = ets:new(rebar_vsn_cache,[named_table, public]),
-
-    %% Convert command strings to atoms
-    CommandAtoms = [list_to_atom(C) || C <- Commands],
-
-    %% Determine the location of the rebar executable; important for pulling
-    %% resources out of the escript
-    rebar_config:set_global(escript, filename:absname(escript:script_name())),
-    ?DEBUG("Rebar location: ~p\n",
-           [rebar_config:get_global(escript, undefined)]),
-
-    %% Note the top-level directory for reference
-    rebar_config:set_global(base_dir, filename:absname(rebar_utils:get_cwd())),
-
-    %% Keep track of how many operations we do, so we can detect bad commands
-    erlang:put(operations, 0),
-
+init_config({Options, _NonOptArgs}) ->
     %% If $HOME/.rebar/config exists load and use as global config
     GlobalConfigFile = filename:join([os:getenv("HOME"), ".rebar", "config"]),
     GlobalConfig = case filelib:is_regular(GlobalConfigFile) of
@@ -124,10 +111,48 @@ run_aux(Commands) ->
                        false ->
                            rebar_config:new()
                    end,
-    BaseConfig = rebar_config:base_config(GlobalConfig),
+
+    %% Set the rebar config to use
+    GlobalConfig1 = case proplists:get_value(config, Options) of
+                        undefined ->
+                            GlobalConfig;
+                        Conf ->
+                            rebar_config:set_global(GlobalConfig, config, Conf)
+                    end,
+
+    GlobalConfig2 = set_log_level(GlobalConfig1, Options),
+    %% Initialize logging system
+    ok = rebar_log:init(GlobalConfig2),
+
+    BaseConfig = rebar_config:base_config(GlobalConfig2),
+
+    %% Keep track of how many operations we do, so we can detect bad commands
+    BaseConfig1 = rebar_config:set_xconf(BaseConfig, operations, 0),
+    %% Initialize vsn cache
+    rebar_config:set_xconf(BaseConfig1, vsn_cache, dict:new()).
+
+run_aux(BaseConfig, Commands) ->
+    %% Make sure crypto is running
+    case crypto:start() of
+        ok -> ok;
+        {error,{already_started,crypto}} -> ok
+    end,
+
+    %% Convert command strings to atoms
+    CommandAtoms = [list_to_atom(C) || C <- Commands],
+
+    %% Determine the location of the rebar executable; important for pulling
+    %% resources out of the escript
+    ScriptName = filename:absname(escript:script_name()),
+    BaseConfig1 = rebar_config:set_xconf(BaseConfig, escript, ScriptName),
+    ?DEBUG("Rebar location: ~p\n", [ScriptName]),
+
+    %% Note the top-level directory for reference
+    AbsCwd = filename:absname(rebar_utils:get_cwd()),
+    BaseConfig2 = rebar_config:set_xconf(BaseConfig1, base_dir, AbsCwd),
 
     %% Process each command, resetting any state between each one
-    rebar_core:process_commands(CommandAtoms, BaseConfig).
+    rebar_core:process_commands(CommandAtoms, BaseConfig2).
 
 %%
 %% print help/usage string
@@ -143,80 +168,80 @@ help() ->
 %% Parse command line arguments using getopt and also filtering out any
 %% key=value pairs. What's left is the list of commands to run
 %%
-parse_args(Args) ->
+parse_args(RawArgs) ->
     %% Parse getopt options
     OptSpecList = option_spec_list(),
-    case getopt:parse(OptSpecList, Args) of
-        {ok, {Options, NonOptArgs}} ->
-            %% Check options and maybe halt execution
-            ok = show_info_maybe_halt(Options, NonOptArgs),
-
-            GlobalDefines = proplists:get_all_values(defines, Options),
-            rebar_config:set_global(defines, GlobalDefines),
-
-            %% Setup profiling flag
-            rebar_config:set_global(enable_profiling,
-                                    proplists:get_bool(profile, Options)),
-
-            %% Set global variables based on getopt options
-            set_log_level(Options),
-            set_global_flag(Options, force),
-            DefJobs = rebar_config:get_jobs(),
-            case proplists:get_value(jobs, Options, DefJobs) of
-                DefJobs ->
-                    ok;
-                Jobs ->
-                    rebar_config:set_global(jobs, Jobs)
-            end,
-
-            %% Set the rebar config to use
-            case proplists:get_value(config, Options) of
-                undefined -> ok;
-                Conf -> rebar_config:set_global(config, Conf)
-            end,
-
-            %% Filter all the flags (i.e. strings of form key=value) from the
-            %% command line arguments. What's left will be the commands to run.
-            unabbreviate_command_names(filter_flags(NonOptArgs, []));
-
+    case getopt:parse(OptSpecList, RawArgs) of
+        {ok, Args} ->
+            Args;
         {error, {Reason, Data}} ->
             ?ERROR("~s ~p~n~n", [Reason, Data]),
             help(),
-            halt(1)
+            rebar_utils:delayed_halt(1)
     end.
+
+save_options(Config, {Options, NonOptArgs}) ->
+    %% Check options and maybe halt execution
+    ok = show_info_maybe_halt(Options, NonOptArgs),
+
+    GlobalDefines = proplists:get_all_values(defines, Options),
+
+    Config1 = rebar_config:set_xconf(Config, defines, GlobalDefines),
+
+    %% Setup profiling flag
+    Config2 = rebar_config:set_xconf(Config1, enable_profiling,
+                                     proplists:get_bool(profile, Options)),
+
+    %% Setup flag to keep running after a single command fails
+    Config3 = rebar_config:set_xconf(Config2, keep_going,
+                                     proplists:get_bool(keep_going, Options)),
+
+    %% Set global variables based on getopt options
+    Config4 = set_global_flag(Config3, Options, force),
+    Config5 = case proplists:get_value(jobs, Options, ?DEFAULT_JOBS) of
+                  ?DEFAULT_JOBS ->
+                      Config4;
+                  Jobs ->
+                      rebar_config:set_global(Config4, jobs, Jobs)
+              end,
+
+    %% Filter all the flags (i.e. strings of form key=value) from the
+    %% command line arguments. What's left will be the commands to run.
+    {Config6, RawCmds} = filter_flags(Config5, NonOptArgs, []),
+    {Config6, unabbreviate_command_names(RawCmds)}.
 
 %%
 %% set log level based on getopt option
 %%
-set_log_level(Options) ->
+set_log_level(Config, Options) ->
     LogLevel = case proplists:get_all_values(verbose, Options) of
                    [] ->
                        rebar_log:default_level();
                    Verbosities ->
                        lists:last(Verbosities)
                end,
-    rebar_config:set_global(verbose, LogLevel).
+    rebar_config:set_global(Config, verbose, LogLevel).
 
 %%
 %% show version information and halt
 %%
 version() ->
     {ok, Vsn} = application:get_key(rebar, vsn),
-    ?CONSOLE("rebar version: ~s date: ~s vcs: ~s\n",
-             [Vsn, ?BUILD_TIME, ?VCS_INFO]).
+    ?CONSOLE("rebar ~s ~s ~s ~s\n",
+             [Vsn, ?OTP_INFO, ?BUILD_TIME, ?VCS_INFO]).
 
 
 %%
 %% set global flag based on getopt option boolean value
 %%
-set_global_flag(Options, Flag) ->
+set_global_flag(Config, Options, Flag) ->
     Value = case proplists:get_bool(Flag, Options) of
                 true ->
                     "1";
                 false ->
                     "0"
             end,
-    rebar_config:set_global(Flag, Value).
+    rebar_config:set_global(Config, Flag, Value).
 
 %%
 %% show info and maybe halt execution
@@ -229,7 +254,7 @@ show_info_maybe_halt(Opts, NonOptArgs) ->
         [] ->
             ?CONSOLE("No command to run specified!~n",[]),
             help(),
-            halt(1);
+            rebar_utils:delayed_halt(1);
         _ ->
             ok
     end.
@@ -271,8 +296,20 @@ generate-upgrade  previous_release=path  Build an upgrade package
 
 generate-appups   previous_release=path  Generate appup files
 
-eunit       [suite=foo]              Run eunit [test/foo_tests.erl] tests
-ct          [suites=] [case=]        Run common_test suites in ./test
+eunit       [suites=foo]             Run eunit tests in foo.erl and
+                                     test/foo_tests.erl
+            [suites=foo] [tests=bar] Run specific eunit tests [first test name
+                                     starting with 'bar' in foo.erl and
+                                     test/foo_tests.erl]
+            [tests=bar]              For every existing suite, run the first
+                                     test whose name starts with bar and, if
+                                     no such test exists, run the test whose
+                                     name starts with bar in the suite's
+                                     _tests module
+
+ct          [suites=] [case=]        Run common_test suites
+
+qc                                   Test QuickCheck properties
 
 xref                                 Run cross reference analysis
 
@@ -281,11 +318,14 @@ version                              Show version information
 ">>,
     io:put_chars(S).
 
+get_jobs(Config) ->
+    rebar_config:get_global(Config, jobs, ?DEFAULT_JOBS).
+
 %%
 %% options accepted via getopt
 %%
 option_spec_list() ->
-    Jobs = rebar_config:get_jobs(),
+    Jobs = ?DEFAULT_JOBS,
     JobsHelp = io_lib:format(
                  "Number of concurrent workers a command may use. Default: ~B",
                  [Jobs]),
@@ -300,19 +340,21 @@ option_spec_list() ->
      {defines,  $D, undefined,  string,    "Define compiler macro"},
      {jobs,     $j, "jobs",     integer,   JobsHelp},
      {config,   $C, "config",   string,    "Rebar config file to use"},
-     {profile,  $p, "profile",  undefined, "Profile this run of rebar"}
+     {profile,  $p, "profile",  undefined, "Profile this run of rebar"},
+     {keep_going, $k, "keep-going", undefined,
+      "Keep running after a command fails"}
     ].
 
 %%
 %% Seperate all commands (single-words) from flags (key=value) and store
 %% values into the rebar_config global storage.
 %%
-filter_flags([], Commands) ->
-    lists:reverse(Commands);
-filter_flags([Item | Rest], Commands) ->
+filter_flags(Config, [], Commands) ->
+    {Config, lists:reverse(Commands)};
+filter_flags(Config, [Item | Rest], Commands) ->
     case string:tokens(Item, "=") of
         [Command] ->
-            filter_flags(Rest, [Command | Commands]);
+            filter_flags(Config, Rest, [Command | Commands]);
         [KeyStr, RawValue] ->
             Key = list_to_atom(KeyStr),
             Value = case Key of
@@ -321,18 +363,18 @@ filter_flags([Item | Rest], Commands) ->
                         _ ->
                             RawValue
                     end,
-            rebar_config:set_global(Key, Value),
-            filter_flags(Rest, Commands);
+            Config1 = rebar_config:set_global(Config, Key, Value),
+            filter_flags(Config1, Rest, Commands);
         Other ->
             ?CONSOLE("Ignoring command line argument: ~p\n", [Other]),
-            filter_flags(Rest, Commands)
+            filter_flags(Config, Rest, Commands)
     end.
 
 command_names() ->
     ["check-deps", "clean", "compile", "create", "create-app", "create-node",
      "ct", "delete-deps", "doc", "eunit", "generate", "generate-appups",
      "generate-upgrade", "get-deps", "help", "list-deps", "list-templates",
-     "update-deps", "overlay", "version", "xref"].
+     "qc", "update-deps", "overlay", "shell", "version", "xref"].
 
 unabbreviate_command_names([]) ->
     [];
