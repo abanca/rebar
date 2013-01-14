@@ -27,6 +27,7 @@
 -module(rebar).
 
 -export([main/1,
+         run/2,
          help/0,
          parse_args/1,
          version/0,
@@ -52,6 +53,7 @@
 %% Public API
 %% ====================================================================
 
+%% escript Entry point
 main(Args) ->
     case catch(run(Args)) of
         ok ->
@@ -64,6 +66,11 @@ main(Args) ->
             io:format("Uncaught error in rebar_core: ~p\n", [Error]),
             rebar_utils:delayed_halt(1)
     end.
+
+%% Erlang-API entry point
+run(BaseConfig, Commands) ->
+    _ = application:load(rebar),
+    run_aux(BaseConfig, Commands).
 
 %% ====================================================================
 %% Internal functions
@@ -276,6 +283,8 @@ commands() ->
 clean                                Clean
 compile                              Compile sources
 
+escriptize                           Generate escript archive
+
 create      template= [var=foo,...]  Create skel based on template and vars
 create-app  [appid=myapp]            Create simple app skel
 create-node [nodeid=mynode]          Create simple node skel
@@ -372,9 +381,10 @@ filter_flags(Config, [Item | Rest], Commands) ->
 
 command_names() ->
     ["check-deps", "clean", "compile", "create", "create-app", "create-node",
-     "ct", "delete-deps", "doc", "eunit", "generate", "generate-appups",
-     "generate-upgrade", "get-deps", "help", "list-deps", "list-templates",
-     "qc", "update-deps", "overlay", "shell", "version", "xref"].
+     "ct", "delete-deps", "doc", "eunit", "escriptize", "generate",
+     "generate-appups", "generate-upgrade", "get-deps", "help", "list-deps",
+     "list-templates", "qc", "update-deps", "overlay", "shell", "version",
+     "xref"].
 
 unabbreviate_command_names([]) ->
     [];
